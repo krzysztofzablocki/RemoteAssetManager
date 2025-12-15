@@ -207,6 +207,82 @@ public actor RemoteAssetManager<Asset: Sendable> {
         configureBackgroundTasks(autoRefreshEvery: interval, refreshOnInit: refreshOnInit)
     }
 
+    /// Initializes a `RemoteAssetManager<Void>` that can skip the initial materialization when bytes are unchanged and a derived artifact exists.
+    ///
+    /// This is useful when `materialize` has expensive filesystem side-effects (e.g. unzipping) and the app can reuse a
+    /// previously derived on-disk artifact when the cached bytes are unchanged.
+    ///
+    /// - Parameter skipInitialMaterializeIfUnchangedAndExistsAt: If provided, and the cached bytes match the persisted
+    ///   `RemoteAssetMetadata` (`byteCount` + `contentHash`), and a filesystem item exists at this URL, then the initial
+    ///   `materialize` call is skipped.
+    public init(
+        baseData: Data,
+        remoteAsset: URL,
+        materialize: Materializer<Void>,
+        fetcher: some RemoteAssetFetching = URLSessionRemoteAssetFetcher(),
+        cacheDirectory: URL? = nil,
+        cacheFileName: String? = nil,
+        appVersion: String? = nil,
+        autoRefreshEvery interval: Duration? = nil,
+        refreshOnInit: Bool = true,
+        skipInitialMaterializeIfUnchangedAndExistsAt derivedArtifactURL: URL? = nil
+    ) async throws where Asset == Void {
+        let resolvedAppVersion = Self.resolveAppVersion(appVersion)
+        let paths = try Self.resolveCachePaths(
+            baseAsset: nil,
+            remoteAsset: remoteAsset,
+            cacheDirectory: cacheDirectory,
+            cacheFileName: cacheFileName
+        )
+
+        let initial = try await Self.loadInitial(
+            baseAssetURL: nil,
+            baseData: baseData,
+            cachePaths: paths,
+            appVersion: resolvedAppVersion
+        )
+
+        let contentHash = Self.sha256PrefixHex(of: initial.data)
+        let canReuseDerivedArtifact: Bool = {
+            guard let derivedArtifactURL else { return false }
+            guard FileManager.default.fileExists(atPath: derivedArtifactURL.path) else { return false }
+            guard initial.metadata.byteCount == initial.data.count else { return false }
+            guard initial.metadata.contentHash == contentHash else { return false }
+            return true
+        }()
+
+        if canReuseDerivedArtifact {
+            asset = ()
+        } else {
+            asset = try materialize(initial.data)
+        }
+
+        remoteAssetURL = remoteAsset
+        cachedAssetURL = paths.cachedAssetURL
+        metadataURL = paths.metadataURL
+        self.appVersion = resolvedAppVersion
+        self.materialize = materialize
+        self.fetcher = fetcher
+        store = initial.store
+        autoRefreshTask = nil
+
+        let statusBuild = Self.buildStatus(
+            remoteAsset: remoteAsset,
+            cacheFileName: paths.cacheFileName,
+            appVersion: resolvedAppVersion,
+            metadata: initial.metadata,
+            data: initial.data,
+            contentHash: contentHash
+        )
+        status = statusBuild.status
+
+        if let metadataToPersist = statusBuild.metadataToPersist {
+            await initial.store.writeMetadata(metadata: metadataToPersist, metadataURL: paths.metadataURL)
+        }
+
+        configureBackgroundTasks(autoRefreshEvery: interval, refreshOnInit: refreshOnInit)
+    }
+
     @discardableResult
     public func refresh() async throws -> RemoteAssetRefreshOutcome {
         if isRefreshing {
@@ -331,9 +407,10 @@ public actor RemoteAssetManager<Asset: Sendable> {
         cacheFileName: String,
         appVersion: String,
         metadata: RemoteAssetMetadata,
-        data: Data
+        data: Data,
+        contentHash: String? = nil
     ) -> StatusBuild {
-        let contentHash = sha256PrefixHex(of: data)
+        let contentHash = contentHash ?? sha256PrefixHex(of: data)
 
         var updatedMetadata: RemoteAssetMetadata?
         if metadata.byteCount != data.count || metadata.contentHash != contentHash || metadata.lastUpdatedAt == nil {

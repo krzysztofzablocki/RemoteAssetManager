@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import RemoteAssetManager
 import Testing
@@ -140,6 +141,95 @@ struct RemoteAssetManagerTests {
         #expect(refreshedMetadata.cacheHeaders.etag == nil)
     }
 
+    @Test
+    func skipInitialMaterializeWhenUnchangedAndDerivedArtifactExists() async throws {
+        let temp = try Self.makeTempDir()
+        let cacheDir = temp.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true, attributes: nil)
+
+        let cacheFileName = "asset.bin"
+        let cachedAssetURL = cacheDir.appendingPathComponent(cacheFileName)
+        let cachedData = Data("cached".utf8)
+        try cachedData.write(to: cachedAssetURL)
+
+        let digest = SHA256.hash(data: cachedData)
+        let hex = digest.compactMap { String(format: "%02x", $0) }.joined()
+        let contentHash = String(hex.prefix(16))
+
+        let metadataURL = cacheDir.appendingPathComponent("\(cacheFileName).metadata.json")
+        let metadata = RemoteAssetMetadata(
+            appVersion: "1",
+            cacheHeaders: .init(),
+            lastCheckedAt: nil,
+            lastUpdatedAt: Date(),
+            byteCount: cachedData.count,
+            contentHash: contentHash
+        )
+        try JSONEncoder().encode(metadata).write(to: metadataURL)
+
+        let derived = cacheDir.appendingPathComponent("extracted", isDirectory: true)
+        try FileManager.default.createDirectory(at: derived, withIntermediateDirectories: true, attributes: nil)
+
+        let probe = MaterializeProbe()
+        _ = try await RemoteAssetManager<Void>(
+            baseData: Data(),
+            remoteAsset: try Self.remoteURL(),
+            materialize: .init { _ in probe.mark() },
+            fetcher: MockFetcher { _, _ in .init(data: nil, cacheHeaders: .init()) },
+            cacheDirectory: cacheDir,
+            cacheFileName: cacheFileName,
+            appVersion: "1",
+            autoRefreshEvery: nil,
+            refreshOnInit: false,
+            skipInitialMaterializeIfUnchangedAndExistsAt: derived
+        )
+
+        #expect(probe.called == false)
+    }
+
+    @Test
+    func doesNotSkipInitialMaterializeWhenDerivedArtifactMissing() async throws {
+        let temp = try Self.makeTempDir()
+        let cacheDir = temp.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true, attributes: nil)
+
+        let cacheFileName = "asset.bin"
+        let cachedAssetURL = cacheDir.appendingPathComponent(cacheFileName)
+        let cachedData = Data("cached".utf8)
+        try cachedData.write(to: cachedAssetURL)
+
+        let digest = SHA256.hash(data: cachedData)
+        let hex = digest.compactMap { String(format: "%02x", $0) }.joined()
+        let contentHash = String(hex.prefix(16))
+
+        let metadataURL = cacheDir.appendingPathComponent("\(cacheFileName).metadata.json")
+        let metadata = RemoteAssetMetadata(
+            appVersion: "1",
+            cacheHeaders: .init(),
+            lastCheckedAt: nil,
+            lastUpdatedAt: Date(),
+            byteCount: cachedData.count,
+            contentHash: contentHash
+        )
+        try JSONEncoder().encode(metadata).write(to: metadataURL)
+
+        let probe = MaterializeProbe()
+        _ = try await RemoteAssetManager<Void>(
+            baseData: Data(),
+            remoteAsset: try Self.remoteURL(),
+            materialize: .init { _ in probe.mark() },
+            fetcher: MockFetcher { _, _ in .init(data: nil, cacheHeaders: .init()) },
+            cacheDirectory: cacheDir,
+            cacheFileName: cacheFileName,
+            appVersion: "1",
+            autoRefreshEvery: nil,
+            refreshOnInit: false,
+            skipInitialMaterializeIfUnchangedAndExistsAt: cacheDir.appendingPathComponent("does-not-exist")
+        )
+
+        #expect(probe.called == true)
+    }
+
     private static func makeTempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
@@ -185,5 +275,22 @@ private actor SequenceFetcher: RemoteAssetFetching {
             return .init(data: nil, cacheHeaders: cacheHeaders)
         }
         return outcomes.removeFirst()
+    }
+}
+
+private final class MaterializeProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _called: Bool = false
+
+    func mark() {
+        lock.lock()
+        _called = true
+        lock.unlock()
+    }
+
+    var called: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _called
     }
 }
